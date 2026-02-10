@@ -1,0 +1,36 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+#
+# Two-machine Vagrant setup for Tailscale CNI development:
+#   - control-plane: Kubernetes API server / control plane
+#   - node: Worker node for CNI testing
+#
+
+Vagrant.configure("2") do |config|
+  config.vm.box = "bento/ubuntu-24.04"
+
+  config.vm.define "control-plane" do |cp|
+    cp.vm.hostname = "ts-cni-dev-control-plane"
+    cp.vm.network "private_network", ip: "192.168.56.10"
+    cp.vm.network "forwarded_port", guest: 6443, host: 16443, host_ip: "127.0.0.1"
+    cp.vm.provider "virtualbox" do |vb|
+      vb.cpus = 1
+      vb.memory = "1024"
+      # vb.gui = true
+    end
+  end
+
+  config.vm.define "node" do |node|
+    node.vm.hostname = "ts-cni-dev-node"
+    node.vm.network "private_network", ip: "192.168.56.11"
+    node.vm.provider "virtualbox" do |vb|
+      vb.cpus = 1
+      vb.memory = "1024"
+    end
+  end
+
+  config.vm.provision "ansible" do |ansible|
+    ansible.playbook = "playbook.yml"
+    ansible.limit = "all"
+  end
+end

@@ -1,0 +1,118 @@
+---
+# Tailscale CNI test environment for K3s
+# - All nodes: Tailscale installed (hostname set in Vagrantfile); join tailnet manually
+# - control-plane: K3s server with no CNI (--flannel-backend=none)
+# - node: K3s agent joining control-plane
+#
+# After provisioning, run the printed tailscale up commands on each VM to join your tailnet.
+- name: Common provisioning
+  hosts: all
+  become: true
+  vars:
+    k3s_control_plane_ip: "192.168.56.10"
+    k3s_server_url: "https://192.168.56.10:6443"
+    k3s_token: "ts-cni-dev-token"
+    ts_cni_hostname: "ts-cni-dev-{{ inventory_hostname }}"
+    tailscale_advertise_tags: "tag:tailscale-cni-dev"
+  tasks:
+    - name: Install Tailscale dependencies
+      apt:
+        name: [ca-certificates, curl]
+        state: present
+        update_cache: true
+
+    - name: Add Tailscale apt signing key
+      ansible.builtin.get_url:
+        url: "https://pkgs.tailscale.com/stable/ubuntu/{{ ansible_facts['distribution_release'] }}.noarmor.gpg"
+        dest: /usr/share/keyrings/tailscale-archive-keyring.gpg
+        mode: "0644"
+        force: true
+
+    - name: Add Tailscale apt repository
+      ansible.builtin.get_url:
+        url: "https://pkgs.tailscale.com/stable/ubuntu/{{ ansible_facts['distribution_release'] }}.tailscale-keyring.list"
+        dest: /etc/apt/sources.list.d/tailscale.list
+        mode: "0644"
+        force: true
+
+    - name: Install Tailscale
+      apt:
+        name: tailscale
+        state: present
+        update_cache: true
+
+    - name: Print Tailscale join command
+      debug:
+        msg: |
+          To join this machine to your tailnet, SSH in and run:
+            sudo tailscale up --hostname={{ ts_cni_hostname }} --advertise-tags={{ tailscale_advertise_tags }}
+          Then approve the node at https://login.tailscale.com/admin/machines
+
+- name: Control plane specific
+  hosts: control-plane
+  become: true
+  vars:
+    k3s_token: "ts-cni-dev-token"
+    k3s_cluster_cidr: "10.99.0.0/16"   # pod CIDR (unique to avoid clashes)
+    k3s_service_cidr: "10.98.0.0/16"   # service CIDR
+  tasks:
+    - name: Install K3s server (no CNI)
+      shell: |
+        curl -sfL https://get.k3s.io | sh -s - server \
+          --flannel-backend=none \
+          --cluster-cidr={{ k3s_cluster_cidr }} \
+          --service-cidr={{ k3s_service_cidr }} \
+          --disable=traefik,servicelb \
+          --token={{ k3s_token }}
+      args:
+        creates: /usr/local/bin/k3s
+
+    - name: Wait for K3s API to be ready
+      wait_for:
+        port: 6443
+        delay: 5
+        timeout: 60
+
+- name: Node specific
+  hosts: node
+  become: true
+  vars:
+    k3s_control_plane_ip: "192.168.56.10"
+    k3s_server_url: "https://192.168.56.10:6443"
+    k3s_token: "ts-cni-dev-token"
+  tasks:
+    - name: Wait for control-plane K3s API
+      wait_for:
+        host: "{{ k3s_control_plane_ip }}"
+        port: 6443
+        delay: 10
+        timeout: 120
+
+    - name: Install K3s agent
+      shell: |
+        curl -sfL https://get.k3s.io | sh -s - agent \
+          --server={{ k3s_server_url }} \
+          --token={{ k3s_token }}
+      args:
+        creates: /usr/local/bin/k3s
+
+# Copy kubeconfig to host so kubectl can target the cluster via forwarded port 16443
+- name: Export kubeconfig to host
+  hosts: control-plane
+  gather_facts: false
+  vars:
+    kubeconfig_host_port: "16443"
+  tasks:
+    - name: Read kubeconfig from control-plane
+      slurp:
+        src: /etc/rancher/k3s/k3s.yaml
+      register: kubeconfig_slurp
+      become: true
+
+    - name: Write kubeconfig to host (testenv/kubeconfig)
+      copy:
+        content: "{{ (kubeconfig_slurp.content | b64decode) | regex_replace('https://[^:]+:6443', 'https://127.0.0.1:' ~ kubeconfig_host_port) }}"
+        dest: "{{ playbook_dir }}/kubeconfig"
+        mode: "0600"
+      delegate_to: localhost
+      run_once: true
