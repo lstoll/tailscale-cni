@@ -1,10 +1,4 @@
 ---
-# Tailscale CNI test environment for K3s
-# - All nodes: Tailscale installed (hostname set in Vagrantfile); join tailnet manually
-# - control-plane: K3s server with no CNI (--flannel-backend=none)
-# - node: K3s agent joining control-plane
-#
-# After provisioning, run the printed tailscale up commands on each VM to join your tailnet.
 - name: Common provisioning
   hosts: all
   become: true
@@ -41,12 +35,64 @@
         state: present
         update_cache: true
 
+    # Don't start tailscaled on boot (Vagrant may still be configuring network)
+    - name: Disable tailscaled from starting at boot
+      systemd:
+        name: tailscaled
+        enabled: false
+        daemon_reload: true
+
+    - name: Start tailscaled (runs after provision has network and resolv.conf ready)
+      systemd:
+        name: tailscaled
+        state: started
+
     - name: Print Tailscale join command
       debug:
         msg: |
           To join this machine to your tailnet, SSH in and run:
-            sudo tailscale up --hostname={{ ts_cni_hostname }} --advertise-tags={{ tailscale_advertise_tags }}
+            sudo tailscale up --advertise-tags={{ tailscale_advertise_tags }}
           Then approve the node at https://login.tailscale.com/admin/machines
+
+    - name: Set tailscale_ip from Tailscale interface (when joined to tailnet)
+      set_fact:
+        tailscale_ip: "{{ ansible_facts['tailscale0'].ipv4.address }}"
+      when: ansible_facts['tailscale0'] is defined and ansible_facts['tailscale0'].ipv4 is defined
+
+- name: Install CNI plugins
+  hosts: all
+  become: true
+  vars:
+    cni_plugins_version: "v1.4.0"
+    cni_plugins_arch: "{{ 'arm64' if ansible_facts['architecture'] == 'aarch64' else 'amd64' }}"
+    cni_plugins_url: "https://github.com/containernetworking/plugins/releases/download/{{ cni_plugins_version }}/cni-plugins-linux-{{ cni_plugins_arch }}-{{ cni_plugins_version }}.tgz"
+  tasks:
+    - name: Install CNI plugins for K3s
+      block:
+        - name: Ensure /opt/cni/bin exists
+          file:
+            path: /opt/cni/bin
+            state: directory
+            mode: "0755"
+
+        - name: Download CNI plugins tarball
+          get_url:
+            url: "{{ cni_plugins_url }}"
+            dest: /tmp/cni-plugins.tgz
+            mode: "0644"
+            force: true
+
+        - name: Extract CNI plugins to /opt/cni/bin
+          unarchive:
+            src: /tmp/cni-plugins.tgz
+            dest: /opt/cni/bin
+            remote_src: true
+            creates: /opt/cni/bin/bridge
+
+        - name: Remove CNI plugins tarball
+          file:
+            path: /tmp/cni-plugins.tgz
+            state: absent
 
 - name: Control plane specific
   hosts: control-plane
@@ -56,45 +102,46 @@
     k3s_cluster_cidr: "10.99.0.0/16"   # pod CIDR (unique to avoid clashes)
     k3s_service_cidr: "10.98.0.0/16"   # service CIDR
   tasks:
-    - name: Install K3s server (no CNI)
-      shell: |
-        curl -sfL https://get.k3s.io | sh -s - server \
-          --flannel-backend=none \
-          --cluster-cidr={{ k3s_cluster_cidr }} \
-          --service-cidr={{ k3s_service_cidr }} \
-          --disable=traefik,servicelb \
-          --token={{ k3s_token }}
-      args:
-        creates: /usr/local/bin/k3s
+    - name: Install K3s server and configure for Tailscale
+      when: tailscale_ip is defined and tailscale_ip | length > 0
+      block:
+        - name: Install K3s server (no CNI)
+          shell: |
+            curl -sfL https://get.k3s.io | sh -s - server \
+              --flannel-backend=none \
+              --cluster-cidr={{ k3s_cluster_cidr }} \
+              --service-cidr={{ k3s_service_cidr }} \
+              --disable=traefik,servicelb \
+              --token={{ k3s_token }}
+          args:
+            creates: /usr/local/bin/k3s
 
-    - name: Wait for K3s API to be ready
-      wait_for:
-        port: 6443
-        delay: 5
-        timeout: 60
+        - name: Ensure k3s systemd drop-in directory exists
+          file:
+            path: /etc/systemd/system/k3s.service.d
+            state: directory
+            mode: "0755"
 
-- name: Node specific
-  hosts: node
-  become: true
-  vars:
-    k3s_control_plane_ip: "192.168.56.10"
-    k3s_server_url: "https://192.168.56.10:6443"
-    k3s_token: "ts-cni-dev-token"
-  tasks:
-    - name: Wait for control-plane K3s API
-      wait_for:
-        host: "{{ k3s_control_plane_ip }}"
-        port: 6443
-        delay: 10
-        timeout: 120
+        - name: Create systemd drop-in for advertise-address and node-ip (Tailscale)
+          copy:
+            content: |
+              [Service]
+              ExecStart=
+              ExecStart=/usr/local/bin/k3s server --flannel-backend=none --cluster-cidr={{ k3s_cluster_cidr }} --service-cidr={{ k3s_service_cidr }} --disable=traefik,servicelb --token={{ k3s_token }} --advertise-address={{ tailscale_ip }} --node-ip={{ tailscale_ip }}
+            dest: /etc/systemd/system/k3s.service.d/advertise-address.conf
+            mode: "0644"
 
-    - name: Install K3s agent
-      shell: |
-        curl -sfL https://get.k3s.io | sh -s - agent \
-          --server={{ k3s_server_url }} \
-          --token={{ k3s_token }}
-      args:
-        creates: /usr/local/bin/k3s
+        - name: Reload systemd and restart K3s to use Tailscale for API and node traffic
+          systemd:
+            name: k3s
+            state: restarted
+            daemon_reload: true
+
+        - name: Wait for K3s API to be ready
+          wait_for:
+            port: 6443
+            delay: 5
+            timeout: 60
 
 # Copy kubeconfig to host so kubectl can target the cluster via forwarded port 16443
 - name: Export kubeconfig to host
@@ -103,16 +150,68 @@
   vars:
     kubeconfig_host_port: "16443"
   tasks:
-    - name: Read kubeconfig from control-plane
-      slurp:
-        src: /etc/rancher/k3s/k3s.yaml
-      register: kubeconfig_slurp
-      become: true
+    - name: Export kubeconfig when K3s was installed
+      block:
+        - name: Read kubeconfig from control-plane
+          slurp:
+            src: /etc/rancher/k3s/k3s.yaml
+          register: kubeconfig_slurp
+          become: true
 
-    - name: Write kubeconfig to host (testenv/kubeconfig)
-      copy:
-        content: "{{ (kubeconfig_slurp.content | b64decode) | regex_replace('https://[^:]+:6443', 'https://127.0.0.1:' ~ kubeconfig_host_port) }}"
-        dest: "{{ playbook_dir }}/kubeconfig"
-        mode: "0600"
-      delegate_to: localhost
-      run_once: true
+        - name: Write kubeconfig to host (testenv/kubeconfig)
+          copy:
+            content: "{{ (kubeconfig_slurp.content | b64decode) | regex_replace('https://[^:]+:6443', 'https://127.0.0.1:' ~ kubeconfig_host_port) }}"
+            dest: "{{ playbook_dir }}/kubeconfig"
+            mode: "0600"
+          delegate_to: localhost
+          run_once: true
+      when: tailscale_ip is defined and tailscale_ip | length > 0
+
+# Will need to run a deploy before this passes successfully
+- name: Node specific
+  hosts: node
+  become: true
+  vars:
+    k3s_control_plane_ip: "192.168.56.10"
+    k3s_server_url: "https://192.168.56.10:6443"
+    k3s_token: "ts-cni-dev-token"
+  tasks:
+    - name: Install K3s agent and configure for Tailscale
+      when: tailscale_ip is defined and tailscale_ip | length > 0
+      block:
+        - name: Wait for control-plane K3s API
+          wait_for:
+            host: "{{ k3s_control_plane_ip }}"
+            port: 6443
+            delay: 10
+            timeout: 120
+
+        - name: Install K3s agent
+          shell: |
+            curl -sfL https://get.k3s.io | sh -s - agent \
+              --server={{ k3s_server_url }} \
+              --token={{ k3s_token }}
+          args:
+            creates: /usr/local/bin/k3s
+
+        - name: Ensure k3s-agent systemd drop-in directory exists
+          file:
+            path: /etc/systemd/system/k3s-agent.service.d
+            state: directory
+            mode: "0755"
+
+        - name: Create systemd drop-in for node-ip (Tailscale)
+          copy:
+            content: |
+              [Service]
+              ExecStart=
+              ExecStart=/usr/local/bin/k3s agent --server={{ k3s_server_url }} --token={{ k3s_token }} --node-ip={{ tailscale_ip }}
+            dest: /etc/systemd/system/k3s-agent.service.d/node-ip.conf
+            mode: "0644"
+
+        - name: Reload systemd and restart K3s agent to use Tailscale for node traffic
+          systemd:
+            name: k3s-agent
+            state: restarted
+            daemon_reload: true
+

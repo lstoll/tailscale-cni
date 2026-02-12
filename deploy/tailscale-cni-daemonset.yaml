@@ -1,0 +1,113 @@
+# Tailscale CNI DaemonSet: runs on each node, writes CNI config (bridge+portmap),
+# advertises the node's pod CIDR via Tailscale, enables accept-routes, configures
+# nftables masq for pod egress, and manages host routes to other nodes' pod CIDRs.
+# Use Tailscale ACLs and subnet auto-approvers to control who can reach pod CIDRs (see README).
+#
+# Host networking: The pod uses hostNetwork: true, so it runs in the host's
+# network namespace. Routes and nftables rules are applied on the host. The
+# container must run privileged with NET_ADMIN so it can add/delete routes
+# (via netlink) and configure nftables for masquerading.
+#
+# Prerequisites:
+# - Tailscale running on each node (tailscaled), joined to your tailnet.
+#   Approve subnet routes in the admin console if using ACLs.
+# - K3s: start with --flannel-backend=none and --cluster-cidr=10.99.0.0/16 (or your CIDR).
+# - Nodes must have spec.podCIDR set (K3s without flannel may not set this;
+#   you can patch nodes or use a small controller to assign from cluster-cidr).
+# - Install CNI plugins (bridge, host-local, portmap) in the path K3s uses:
+#   /var/lib/rancher/k3s/data/current/bin (e.g. extract cni-plugins tarball there
+#   or symlink from /opt/cni/bin). We write the conflist to /etc/cni/net.d on the
+#   host (mounted into the pod); K3s containerd reads from /etc/cni/net.d.
+#
+# If kubelet reports "cni plugin not initialized": (1) ensure our conflist exists
+# in the CNI config dir on the node; (2) ensure bridge, host-local, portmap
+# exist in /var/lib/rancher/k3s/data/current/bin (same arch as the node).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: tailscale-cni
+  namespace: kube-system
+  labels:
+    app: tailscale-cni
+spec:
+  selector:
+    matchLabels:
+      app: tailscale-cni
+  template:
+    metadata:
+      labels:
+        app: tailscale-cni
+    spec:
+      hostNetwork: true
+      hostPID: true
+      tolerations:
+        - operator: Exists
+      serviceAccountName: tailscale-cni
+      containers:
+        - name: tailscale-cni
+          image: tailscale-cni:latest   # build and load in testenv, or use your registry
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: CNI_DIR
+              value: "/etc/cni/net.d"
+            - name: CLUSTER_CIDR
+              value: "10.99.0.0/16"
+          args:
+            - -tailscale-interface=tailscale0
+          volumeMounts:
+            - name: tailscale-socket
+              mountPath: /var/run/tailscale
+            - name: cni-net-dir
+              mountPath: /etc/cni/net.d
+          # Required for host route management (netlink) and nftables masq.
+          # Routes to other nodes' pod CIDRs are added on the host so pod-to-pod
+          # traffic can reach other nodes via Tailscale.
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - NET_ADMIN
+      volumes:
+        - name: tailscale-socket
+          hostPath:
+            path: /var/run/tailscale
+            type: DirectoryOrCreate
+        - name: cni-net-dir
+          hostPath:
+            # K3s containerd reads from /etc/cni/net.d (see agent containerd config), not agent/etc/cni/net.d
+            path: /etc/cni/net.d
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tailscale-cni
+  namespace: kube-system
+---
+# RBAC: tailscale-cni needs to list/watch nodes (for our pod CIDR and other nodes' routes).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: tailscale-cni
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: tailscale-cni
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: tailscale-cni
+subjects:
+  - kind: ServiceAccount
+    name: tailscale-cni
+    namespace: kube-system
+---

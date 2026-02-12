@@ -29,6 +29,16 @@ Vagrant.configure("2") do |config|
     end
   end
 
+  # Works around some weird config issues - tailscale dns breaks, and also
+  # sometimes the hostnames get messed up. We disable the service, start it
+  # after vagrant does its thing, and set the default DNS manually.
+  $network_script = <<-SCRIPT
+if [ -f  /usr/bin/tailscale ]; then systemctl start tailscaled; fi
+resolvectl dns eth0 10.0.2.3
+SCRIPT
+
+  config.vm.provision :shell, inline: $network_script, run: 'always'
+
   config.vm.provision "ansible" do |ansible|
     ansible.playbook = "playbook.yml"
     ansible.limit = "all"

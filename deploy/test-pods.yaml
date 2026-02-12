@@ -1,0 +1,33 @@
+# Test pods for pod-to-pod connectivity over Tailscale CNI.
+# Deploy, then run: ./testenv/test-pod-network.sh (or see README).
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-pods
+  namespace: default
+  labels:
+    app: test-pods
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: test-pods
+  template:
+    metadata:
+      labels:
+        app: test-pods
+    spec:
+      # Spread across nodes so we get one pod per node for cross-node ping test
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+      containers:
+        - name: sleep
+          image: busybox:1.36
+          command: ["sleep", "infinity"]
+          resources:
+            requests:
+              memory: "32Mi"
+              cpu: "10m"
