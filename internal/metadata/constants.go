@@ -15,4 +15,6 @@ const (
 	PathToken = "/metadata/api/token"
 	// PathIdentity is the path for GET identity for a tailnet IP (query: ip=).
 	PathIdentity = "/metadata/identity"
+	// PathCert is the path for GET TLS cert+key for a service domain (query: domain=).
+	PathCert = "/metadata/cert"
 )

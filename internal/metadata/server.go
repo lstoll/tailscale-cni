@@ -33,26 +33,30 @@ type UserProfileInfo struct {
 	DisplayName string `json:"displayName,omitempty"`
 }
 
-// Server serves the metadata API (token + identity).
+// Server serves the metadata API (token + identity + cert).
 type Server struct {
-	tsClient    *tailscale.Client
-	tokenStore  *TokenStore
-	podResolver PodResolver
-	listenAddr  string
-	srv         *http.Server
+	tsClient       *tailscale.Client
+	tokenStore     *TokenStore
+	podResolver    PodResolver
+	certAuthorizer CertAuthorizer
+	listenAddr     string
+	srv            *http.Server
 }
 
 // NewServer returns a metadata server. Call Run to start listening.
-func NewServer(tsClient *tailscale.Client, tokenStore *TokenStore, podResolver PodResolver, listenAddr string) *Server {
+// certAuthorizer may be nil to disable the cert endpoint.
+func NewServer(tsClient *tailscale.Client, tokenStore *TokenStore, podResolver PodResolver, certAuthorizer CertAuthorizer, listenAddr string) *Server {
 	s := &Server{
-		tsClient:    tsClient,
-		tokenStore:  tokenStore,
-		podResolver: podResolver,
-		listenAddr:  listenAddr,
+		tsClient:       tsClient,
+		tokenStore:     tokenStore,
+		podResolver:    podResolver,
+		certAuthorizer: certAuthorizer,
+		listenAddr:     listenAddr,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc(PathToken, s.servePutToken)
 	mux.HandleFunc(PathIdentity, s.serveGetIdentity)
+	mux.HandleFunc(PathCert, s.serveGetCert)
 	s.srv = &http.Server{
 		Addr:         listenAddr,
 		Handler:      mux,
@@ -157,6 +161,60 @@ func (s *Server) serveGetIdentity(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// CertResponse is the JSON returned for GET /metadata/cert?domain=...
+type CertResponse struct {
+	CertPEM string `json:"certPEM"`
+	KeyPEM  string `json:"keyPEM"`
+}
+
+func (s *Server) serveGetCert(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	token := r.Header.Get(TokenHeader)
+	if token == "" || !s.tokenStore.Valid(token) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if s.certAuthorizer == nil {
+		http.Error(w, "cert endpoint disabled", http.StatusNotFound)
+		return
+	}
+	domain := r.URL.Query().Get("domain")
+	domain = strings.TrimSpace(domain)
+	if domain == "" {
+		http.Error(w, "missing query domain=", http.StatusBadRequest)
+		return
+	}
+	domain = normalizeDomain(domain)
+	if !validFQDN(domain) {
+		http.Error(w, "invalid domain", http.StatusBadRequest)
+		return
+	}
+	callerIP, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		callerIP = r.RemoteAddr
+	}
+	if !s.certAuthorizer.AllowedCertDomain(callerIP, domain) {
+		if s.podResolver != nil {
+			if ns, name, ok := s.podResolver.PodForIP(callerIP); ok {
+				log.Printf("metadata: cert denied for domain %s from pod %s/%s", domain, ns, name)
+			}
+		}
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	certPEM, keyPEM, err := s.tsClient.CertPair(r.Context(), domain)
+	if err != nil {
+		log.Printf("metadata: CertPair(%s): %v", domain, err)
+		http.Error(w, "cert lookup failed", http.StatusBadGateway)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(&CertResponse{CertPEM: string(certPEM), KeyPEM: string(keyPEM)})
 }
 
 // ParseIdentityURL returns the metadata base URL using the standard metadata IP and port.

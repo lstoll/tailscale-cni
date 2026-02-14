@@ -47,6 +47,38 @@ func BuildDesiredServices(
 	return desired, managed
 }
 
+// LocalPodIPsByServiceName returns, for each managed Tailscale service (our LoadBalancer with local endpoints),
+// the list of pod IPs that are local backends. Caller can map service name to MagicDNS domain and use this
+// for cert authorizer: domain -> pod IPs allowed to request that domain's cert.
+func LocalPodIPsByServiceName(
+	nodeName string,
+	podCIDR string,
+	services []*corev1.Service,
+	allEndpointSlices []*discoveryv1.EndpointSlice,
+) map[tailcfg.ServiceName][]string {
+	out := make(map[tailcfg.ServiceName][]string)
+	for _, svc := range services {
+		if !IsOurLoadBalancerService(svc) {
+			continue
+		}
+		if svc.Spec.ClusterIP == "" || svc.Spec.ClusterIP == corev1.ClusterIPNone {
+			continue
+		}
+		slices := endpointSlicesForService(svc, allEndpointSlices)
+		localEndpoints := localEndpointsForService(nodeName, podCIDR, slices)
+		if len(localEndpoints) == 0 {
+			continue
+		}
+		svcName := TailscaleServiceName(svc)
+		ips := make([]string, 0, len(localEndpoints))
+		for _, le := range localEndpoints {
+			ips = append(ips, le.address)
+		}
+		out[svcName] = ips
+	}
+	return out
+}
+
 // IsOurLoadBalancerService reports whether the Service uses our loadBalancerClass.
 func IsOurLoadBalancerService(svc *corev1.Service) bool {
 	if svc.Spec.Type != corev1.ServiceTypeLoadBalancer {
