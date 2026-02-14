@@ -13,51 +13,15 @@ export KUBECONFIG
 
 cd "$REPO_ROOT"
 
-# echo "=== Vagrant status ==="
-# (cd "$SCRIPT_DIR" && vagrant status)
-
-# echo ""
-# echo "=== Ensuring VMs are up ==="
-# (cd "$SCRIPT_DIR" && vagrant up)
-
-# echo ""
-# echo "=== Patching pod CIDRs on all nodes (K3s with no flannel may not set these) ==="
-# export KUBECONFIG
-# # Discover cluster nodes and assign each a /24 from 10.99.0.0/16 so both nodes advertise
-# NODES=($(kubectl get nodes -o jsonpath='{.items[*].metadata.name}'))
-# if [[ ${#NODES[@]} -eq 0 ]]; then
-#   echo "  No nodes found. Is the cluster up? (vagrant up, then retry)"
-#   exit 1
-# fi
-# echo "  Found ${#NODES[@]} node(s): ${NODES[*]}"
-# for i in "${!NODES[@]}"; do
-#   # 10.99.0.0/24, 10.99.1.0/24, ...
-#   CIDR="10.99.${i}.0/24"
-#   echo "  Patching ${NODES[$i]} -> podCIDR $CIDR"
-#   kubectl patch node "${NODES[$i]}" --type=merge -p "{\"spec\":{\"podCIDR\":\"$CIDR\"}}"
-# done
-
-# Both Vagrant VMs (must match Vagrantfile: control-plane, node)
 VAGRANT_VMS=(control-plane node)
-
-# echo ""
-# echo "=== Pre-loading pause image on both Vagrant nodes: ${VAGRANT_VMS[*]} ==="
-# PAUSE_IMAGE="${PAUSE_IMAGE:-rancher/mirrored-pause:3.6}"
-# if ! docker image inspect "$PAUSE_IMAGE" &>/dev/null; then
-#   docker pull --platform linux/arm64 "$PAUSE_IMAGE"
-# fi
-# PAUSE_TAR=$(mktemp -t pause-image.XXXXXX.tar)
-# trap "rm -f $PAUSE_TAR" EXIT
-# docker save "$PAUSE_IMAGE" -o "$PAUSE_TAR"
-# for vm in "${VAGRANT_VMS[@]}"; do
-#   echo "  $vm..."
-#   (cd "$SCRIPT_DIR" && vagrant ssh "$vm" -c "sudo k3s ctr -n k8s.io images import -" < "$PAUSE_TAR")
-# done
-# rm -f "$PAUSE_TAR"
 
 echo ""
 echo "=== Building and pushing tailscale-cni image to both Vagrant nodes: ${VAGRANT_VMS[*]} ==="
 "$SCRIPT_DIR/push-image.sh"
+
+echo ""
+echo "=== Deleting existing CNI pods ==="
+kubectl -n kube-system delete pods -l app=tailscale-cni
 
 echo ""
 echo "=== Applying Tailscale CNI DaemonSet ==="

@@ -14,10 +14,10 @@
 # - K3s: start with --flannel-backend=none and --cluster-cidr=10.99.0.0/16 (or your CIDR).
 # - Nodes must have spec.podCIDR set (K3s without flannel may not set this;
 #   you can patch nodes or use a small controller to assign from cluster-cidr).
-# - Install CNI plugins (bridge, host-local, portmap) in the path K3s uses:
-#   /var/lib/rancher/k3s/data/current/bin (e.g. extract cni-plugins tarball there
-#   or symlink from /opt/cni/bin). We write the conflist to /etc/cni/net.d on the
-#   host (mounted into the pod); K3s containerd reads from /etc/cni/net.d.
+# - CNI plugins: we copy bridge, host-local, portmap from the image into the host
+#   plugin dir (set CNI_BIN_DIR to the mount path, e.g. /host/opt/cni/bin). Ensure
+#   K3s uses that dir (e.g. /opt/cni/bin on the host, or symlink from
+#   /var/lib/rancher/k3s/data/current/bin). We write the conflist to /etc/cni/net.d.
 #
 # If kubelet reports "cni plugin not initialized": (1) ensure our conflist exists
 # in the CNI config dir on the node; (2) ensure bridge, host-local, portmap
@@ -54,6 +54,8 @@ spec:
                   fieldPath: spec.nodeName
             - name: CNI_DIR
               value: "/etc/cni/net.d"
+            - name: CNI_BIN_DIR
+              value: "/opt/cni/bin"
             - name: CLUSTER_CIDR
               value: "10.99.0.0/16"
           args:
@@ -63,9 +65,9 @@ spec:
               mountPath: /var/run/tailscale
             - name: cni-net-dir
               mountPath: /etc/cni/net.d
+            - name: cni-bin-dir
+              mountPath: /opt/cni/bin
           # Required for host route management (netlink) and nftables masq.
-          # Routes to other nodes' pod CIDRs are added on the host so pod-to-pod
-          # traffic can reach other nodes via Tailscale.
           securityContext:
             privileged: true
             capabilities:
@@ -78,9 +80,13 @@ spec:
             type: DirectoryOrCreate
         - name: cni-net-dir
           hostPath:
-            # K3s containerd reads from /etc/cni/net.d (see agent containerd config), not agent/etc/cni/net.d
             path: /etc/cni/net.d
             type: DirectoryOrCreate
+        - name: cni-bin-dir
+          hostPath:
+            path: /opt/cni/bin
+            type: DirectoryOrCreate
+
 ---
 apiVersion: v1
 kind: ServiceAccount

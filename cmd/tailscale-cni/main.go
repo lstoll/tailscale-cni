@@ -28,6 +28,8 @@ import (
 
 func main() {
 	cniDir := flag.String("cni-dir", defaultEnv("CNI_DIR", "/etc/cni/net.d"), "Host path to write CNI conflist")
+	cniBinDir := flag.String("cni-bin-dir", defaultEnv("CNI_BIN_DIR", ""), "If set, copy bridge/host-local/portmap from -cni-plugin-source into this dir (host plugin path)")
+	cniPluginSource := flag.String("cni-plugin-source", defaultEnv("CNI_PLUGIN_SOURCE", "/cni"), "Path to built-in CNI plugins in the container (source for copy)")
 	bridgeName := flag.String("bridge", "cni0", "Bridge name for CNI")
 	clusterCIDR := flag.String("cluster-cidr", defaultEnv("CLUSTER_CIDR", "10.99.0.0/16"), "Cluster pod CIDR (for routes and CNI config)")
 	tailscaleSocket := flag.String("tailscale-socket", "", "Path to Tailscale socket (default: platform default)")
@@ -51,11 +53,13 @@ func main() {
 	routeManager := routes.NewManager(*tailscaleIface)
 
 	opts := runReconcileOpts{
-		tsClient:       tsClient,
-		cniDir:         *cniDir,
-		bridgeName:     *bridgeName,
-		clusterCIDR:    *clusterCIDR,
-		tailscaleIface: *tailscaleIface,
+		tsClient:        tsClient,
+		cniDir:          *cniDir,
+		cniBinDir:       *cniBinDir,
+		cniPluginSource: *cniPluginSource,
+		bridgeName:      *bridgeName,
+		clusterCIDR:     *clusterCIDR,
+		tailscaleIface:  *tailscaleIface,
 	}
 
 	ctrl, err := controller.New(kubeConfig, *nodeName, func(ctx context.Context, ourPodCIDR string) error {
@@ -84,11 +88,13 @@ func defaultEnv(key, fallback string) string {
 }
 
 type runReconcileOpts struct {
-	tsClient       *tailscale.Client
-	cniDir         string
-	bridgeName     string
-	clusterCIDR    string
-	tailscaleIface string
+	tsClient        *tailscale.Client
+	cniDir          string
+	cniBinDir       string
+	cniPluginSource string
+	bridgeName      string
+	clusterCIDR     string
+	tailscaleIface  string
 }
 
 func runReconcile(ctx context.Context, o runReconcileOpts, ourPodCIDR string) error {
@@ -96,7 +102,12 @@ func runReconcile(ctx context.Context, o runReconcileOpts, ourPodCIDR string) er
 		return nil
 	}
 
-	// 1) Write CNI config so kubelet uses bridge + host-local + portmap
+	// 1) Optionally copy built-in CNI plugins to host, then write CNI config
+	if o.cniBinDir != "" {
+		if err := cni.CopyPlugins(o.cniPluginSource, o.cniBinDir); err != nil {
+			return fmt.Errorf("copy CNI plugins: %w", err)
+		}
+	}
 	if err := cni.WriteConflist(o.cniDir, "tailscale-cni", o.bridgeName, ourPodCIDR, o.clusterCIDR); err != nil {
 		return fmt.Errorf("write CNI config: %w", err)
 	}

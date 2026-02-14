@@ -37,8 +37,8 @@ func TestWriteConflist(t *testing.T) {
 
 func TestGatewayFromSubnet(t *testing.T) {
 	tests := []struct {
-		subnet  string
-		wantGW  string
+		subnet string
+		wantGW string
 	}{
 		{"10.99.0.0/24", "10.99.0.1"},
 		{"10.99.1.0/24", "10.99.1.1"},
@@ -64,3 +64,30 @@ func TestRemove(t *testing.T) {
 	}
 }
 
+func TestCopyPlugins(t *testing.T) {
+	src := t.TempDir()
+	for _, name := range pluginNames {
+		if err := os.WriteFile(filepath.Join(src, name), []byte("fake plugin "+name), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dest := t.TempDir()
+	if err := CopyPlugins(src, dest); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range pluginNames {
+		p := filepath.Join(dest, name)
+		data, err := os.ReadFile(p)
+		if err != nil {
+			t.Errorf("read %s: %v", name, err)
+			continue
+		}
+		if string(data) != "fake plugin "+name {
+			t.Errorf("%s: got %q", name, data)
+		}
+		fi, _ := os.Stat(p)
+		if fi.Mode()&0111 == 0 {
+			t.Errorf("%s: expected executable", name)
+		}
+	}
+}

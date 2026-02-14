@@ -1,6 +1,7 @@
 # Tailscale CNI
 
 CNI driver for Kubernetes that manages subnet routes for pod CIDR ranges.
+Designed around managing a host tailscale daemon, that already exists.
 
 ## Tailscale ACLs
 

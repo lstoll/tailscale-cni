@@ -59,41 +59,6 @@
         tailscale_ip: "{{ ansible_facts['tailscale0'].ipv4.address }}"
       when: ansible_facts['tailscale0'] is defined and ansible_facts['tailscale0'].ipv4 is defined
 
-- name: Install CNI plugins
-  hosts: all
-  become: true
-  vars:
-    cni_plugins_version: "v1.4.0"
-    cni_plugins_arch: "{{ 'arm64' if ansible_facts['architecture'] == 'aarch64' else 'amd64' }}"
-    cni_plugins_url: "https://github.com/containernetworking/plugins/releases/download/{{ cni_plugins_version }}/cni-plugins-linux-{{ cni_plugins_arch }}-{{ cni_plugins_version }}.tgz"
-  tasks:
-    - name: Install CNI plugins for K3s
-      block:
-        - name: Ensure /opt/cni/bin exists
-          file:
-            path: /opt/cni/bin
-            state: directory
-            mode: "0755"
-
-        - name: Download CNI plugins tarball
-          get_url:
-            url: "{{ cni_plugins_url }}"
-            dest: /tmp/cni-plugins.tgz
-            mode: "0644"
-            force: true
-
-        - name: Extract CNI plugins to /opt/cni/bin
-          unarchive:
-            src: /tmp/cni-plugins.tgz
-            dest: /opt/cni/bin
-            remote_src: true
-            creates: /opt/cni/bin/bridge
-
-        - name: Remove CNI plugins tarball
-          file:
-            path: /tmp/cni-plugins.tgz
-            state: absent
-
 - name: Control plane specific
   hosts: control-plane
   become: true

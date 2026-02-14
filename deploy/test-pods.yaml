@@ -18,11 +18,15 @@ spec:
       labels:
         app: test-pods
     spec:
+      terminationGracePeriodSeconds: 1
       # Spread across nodes so we get one pod per node for cross-node ping test
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname
           whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: test-pods
       containers:
         - name: sleep
           image: busybox:1.36

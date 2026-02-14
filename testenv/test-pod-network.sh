@@ -15,6 +15,22 @@ KUBECONFIG="${KUBECONFIG:-$REPO_ROOT/testenv/kubeconfig}"
 
 export KUBECONFIG
 
+echo "=== Deleting existing test-pods ==="
+kubectl delete deployment test-pods || true
+
+echo "=== Waiting for test-pods to be deleted ==="
+for i in $(seq 1 120); do
+  if ! kubectl get pods -l app=test-pods --no-headers 2>/dev/null | grep -q .; then
+    break
+  fi
+  sleep 1
+done
+if kubectl get pods -l app=test-pods --no-headers 2>/dev/null | grep -q .; then
+  echo "Timed out waiting for test-pods to be deleted. Current state:"
+  kubectl get pods -l app=test-pods -o wide
+  exit 1
+fi
+
 echo "=== Deploying test-pods (2 replicas, spread across nodes) ==="
 kubectl apply -f "$REPO_ROOT/deploy/test-pods.yaml"
 
