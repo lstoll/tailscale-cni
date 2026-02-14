@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -17,13 +18,21 @@ import (
 	"github.com/lstoll/tailscale-cni/internal/controller"
 	"github.com/lstoll/tailscale-cni/internal/masq"
 	"github.com/lstoll/tailscale-cni/internal/routes"
+	"github.com/lstoll/tailscale-cni/internal/serve"
 	"github.com/lstoll/tailscale-cni/internal/tailscale"
 
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 
 	"net/netip"
+
+	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/tailcfg"
 )
 
 func main() {
@@ -46,7 +55,10 @@ func main() {
 	kubeConfig, err := rest.InClusterConfig()
 	if err != nil {
 		log.Fatalf("kube config: %v", err)
-
+	}
+	clientset, err := kubernetes.NewForConfig(kubeConfig)
+	if err != nil {
+		log.Fatalf("kube clientset: %v", err)
 	}
 
 	tsClient := tailscale.NewClient(*tailscaleSocket)
@@ -62,12 +74,16 @@ func main() {
 		tailscaleIface:  *tailscaleIface,
 	}
 
+	serveState := &serveReconcileState{}
 	ctrl, err := controller.New(kubeConfig, *nodeName, func(ctx context.Context, ourPodCIDR string) error {
 		return runReconcile(ctx, opts, ourPodCIDR)
 	},
 		controller.WithResyncPeriod(*resyncPeriod),
 		controller.WithOtherRoutesReconciler(func(ctx context.Context, store cache.Store) error {
 			return reconcileOtherNodeRoutes(ctx, store, *nodeName, tsClient, routeManager)
+		}),
+		controller.WithServeReconciler(func(ctx context.Context, nodeStore, serviceStore, endpointSliceStore cache.Store) error {
+			return reconcileServe(ctx, *nodeName, tsClient, clientset, serveState, nodeStore, serviceStore, endpointSliceStore)
 		}),
 	)
 	if err != nil {
@@ -131,6 +147,166 @@ func runReconcile(ctx context.Context, o runReconcileOpts, ourPodCIDR string) er
 	}
 
 	return nil
+}
+
+// serveReconcileState tracks which Tailscale service names we manage so we can
+// remove them from the serve config when they no longer have local endpoints.
+type serveReconcileState struct {
+	mu           sync.Mutex
+	managedNames map[tailcfg.ServiceName]struct{}
+}
+
+// reconcileServe updates Tailscale serve config for LoadBalancer Services with our
+// loadBalancerClass that have at least one local endpoint, and patches Service status.
+func reconcileServe(
+	ctx context.Context,
+	nodeName string,
+	tsClient *tailscale.Client,
+	clientset kubernetes.Interface,
+	state *serveReconcileState,
+	nodeStore, serviceStore, endpointSliceStore cache.Store,
+) error {
+	obj, exists, _ := nodeStore.GetByKey(nodeName)
+	if !exists {
+		return nil
+	}
+	node, _ := obj.(*corev1.Node)
+	if node == nil {
+		return nil
+	}
+	podCIDR := node.Spec.PodCIDR
+
+	services := listServices(serviceStore)
+	slices := listEndpointSlices(endpointSliceStore)
+	desired, managed := serve.BuildDesiredServices(nodeName, podCIDR, services, slices)
+
+	current, err := tsClient.GetServeConfig(ctx)
+	if err != nil {
+		return fmt.Errorf("get serve config: %w", err)
+	}
+	if current == nil {
+		current = &ipn.ServeConfig{}
+	}
+	if current.Services == nil {
+		current.Services = make(map[tailcfg.ServiceName]*ipn.ServiceConfig)
+	}
+
+	state.mu.Lock()
+	lastManaged := state.managedNames
+	state.managedNames = make(map[tailcfg.ServiceName]struct{})
+	for _, n := range managed {
+		state.managedNames[n] = struct{}{}
+	}
+	state.mu.Unlock()
+
+	// De-register: remove from serve config any service we previously advertised
+	// but no longer have local endpoints for (so we stop announcing it to Tailscale).
+	for name := range lastManaged {
+		if _, keep := state.managedNames[name]; !keep {
+			delete(current.Services, name)
+		}
+	}
+	for name, cfg := range desired {
+		current.Services[name] = cfg
+	}
+
+	if err := tsClient.SetServeConfig(ctx, current); err != nil {
+		return fmt.Errorf("set serve config: %w", err)
+	}
+
+	// Tell the control plane we advertise these services (so "Advertising the service" shows in admin).
+	prefs, err := tsClient.GetPrefs(ctx)
+	if err != nil {
+		return fmt.Errorf("get prefs: %w", err)
+	}
+	advertiseList := make([]string, 0, len(prefs.AdvertiseServices)+len(managed))
+	for _, s := range prefs.AdvertiseServices {
+		if _, wasOurs := lastManaged[tailcfg.ServiceName(s)]; !wasOurs {
+			advertiseList = append(advertiseList, s)
+		}
+	}
+	for _, n := range managed {
+		advertiseList = append(advertiseList, string(n))
+	}
+	if err := tsClient.SetAdvertiseServices(ctx, advertiseList); err != nil {
+		return fmt.Errorf("set advertise services: %w", err)
+	}
+	if len(managed) > 0 {
+		log.Printf("serve: advertising %d Tailscale Service(s) to control plane", len(managed))
+	}
+
+	managedSet := make(map[tailcfg.ServiceName]struct{})
+	for _, n := range managed {
+		managedSet[n] = struct{}{}
+	}
+	st, err := tsClient.Status(ctx)
+	if err != nil {
+		return fmt.Errorf("status: %w", err)
+	}
+	magicDNS := magicDNSSuffix(st)
+	if magicDNS != "" {
+		for _, svc := range services {
+			if !serve.IsOurLoadBalancerService(svc) {
+				continue
+			}
+			svcName := serve.TailscaleServiceName(svc)
+			if _, ok := managedSet[svcName]; !ok {
+				continue
+			}
+			hostname := string(svcName.WithoutPrefix()) + "." + magicDNS
+			if err := patchServiceLoadBalancerHostname(ctx, clientset, svc.Namespace, svc.Name, hostname); err != nil {
+				log.Printf("serve: patch service %s/%s status: %v", svc.Namespace, svc.Name, err)
+			}
+		}
+	}
+	return nil
+}
+
+func listServices(store cache.Store) []*corev1.Service {
+	var out []*corev1.Service
+	for _, obj := range store.List() {
+		if svc, ok := obj.(*corev1.Service); ok {
+			out = append(out, svc)
+		}
+	}
+	return out
+}
+
+func listEndpointSlices(store cache.Store) []*discoveryv1.EndpointSlice {
+	var out []*discoveryv1.EndpointSlice
+	for _, obj := range store.List() {
+		if es, ok := obj.(*discoveryv1.EndpointSlice); ok {
+			out = append(out, es)
+		}
+	}
+	return out
+}
+
+func magicDNSSuffix(st *ipnstate.Status) string {
+	if st == nil {
+		return ""
+	}
+	if st.CurrentTailnet != nil && st.CurrentTailnet.MagicDNSSuffix != "" {
+		return st.CurrentTailnet.MagicDNSSuffix
+	}
+	return st.MagicDNSSuffix
+}
+
+func patchServiceLoadBalancerHostname(ctx context.Context, clientset kubernetes.Interface, ns, name, hostname string) error {
+	svc, err := clientset.CoreV1().Services(ns).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	if svc.Status.LoadBalancer.Ingress != nil {
+		for _, ing := range svc.Status.LoadBalancer.Ingress {
+			if ing.Hostname == hostname {
+				return nil
+			}
+		}
+	}
+	svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{Hostname: hostname}}
+	_, err = clientset.CoreV1().Services(ns).UpdateStatus(ctx, svc, metav1.UpdateOptions{})
+	return err
 }
 
 // reconcileOtherNodeRoutes builds desired routes: other nodes' pod CIDR -> our Tailscale IP.

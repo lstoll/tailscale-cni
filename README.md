@@ -24,3 +24,38 @@ Designed around managing a host tailscale daemon, that already exists.
 ```
 
 Adjust `10.99.0.0/16` to your `CLUSTER_CIDR`.
+
+## Tailscale Services
+
+Services can be created in Kubernetes, that will be configure to serve [Tailscale Services]() via the host tailscaled if the pod exists on the node.
+
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-nginx
+  annotations:
+    # Tailscale Service name
+    tailscale-cni.lds.li/service-name: "test-nginx"
+spec:
+  type: LoadBalancer
+  loadBalancerClass: lds.li/tailscale-cni
+  selector:
+    app: test-nginx
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+```
+
+ACL to allow the nodes to serve:
+
+```json
+"autoApprovers": {
+  "services": {
+    "svc:test-nginx": ["tag:tailscale-cni-dev"],
+  },
+},
+```

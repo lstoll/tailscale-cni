@@ -25,9 +25,17 @@ type Reconciler func(ctx context.Context, ourPodCIDR string) error
 // It receives the node informer store to list all nodes.
 type OtherRoutesReconciler func(ctx context.Context, store cache.Store) error
 
+// ServeReconciler is called when Services or EndpointSlices change so the caller
+// can update Tailscale serve config (and optionally Service status) for
+// LoadBalancer Services with our loadBalancerClass that have local endpoints.
+// It receives the node, service, and endpoint slice stores.
+type ServeReconciler func(ctx context.Context, nodeStore, serviceStore, endpointSliceStore cache.Store) error
+
 // Controller watches nodes and triggers reconciliation when our node's pod
 // CIDR changes. It caches the last applied pod CIDR so we only act on real changes.
 // If OtherRoutesReconciler is set, it is also run on any node add/update/delete.
+// If ServeReconciler is set, Service and EndpointSlice informers are started and
+// the callback is run on Service/EndpointSlice events.
 type Controller struct {
 	clientset   kubernetes.Interface
 	nodeName    string
@@ -36,6 +44,7 @@ type Controller struct {
 
 	reconcile            Reconciler
 	otherRoutesReconcile OtherRoutesReconciler
+	serveReconcile       ServeReconciler
 
 	mu              sync.Mutex
 	lastAppliedCIDR string // last pod CIDR we successfully reconciled for
@@ -54,6 +63,12 @@ func WithResyncPeriod(d time.Duration) Option {
 // so routes to other nodes' pod CIDRs can be updated.
 func WithOtherRoutesReconciler(fn OtherRoutesReconciler) Option {
 	return func(c *Controller) { c.otherRoutesReconcile = fn }
+}
+
+// WithServeReconciler sets the callback run when Services or EndpointSlices change,
+// for Tailscale Services (LoadBalancer) support. Requires Service and EndpointSlice informers.
+func WithServeReconciler(fn ServeReconciler) Option {
+	return func(c *Controller) { c.serveReconcile = fn }
 }
 
 // New returns a controller that watches nodes and calls reconcile when our
@@ -76,6 +91,7 @@ func New(config *rest.Config, nodeName string, reconcile Reconciler, opts ...Opt
 
 // Run starts the node informer and blocks until ctx is done. It triggers
 // reconciliation on node add/update when our node's pod CIDR is set or changed.
+// If ServeReconciler is set, also starts Service and EndpointSlice informers.
 func (c *Controller) Run(ctx context.Context) {
 	factory := informers.NewSharedInformerFactory(c.clientset, c.resyncPeriod)
 	nodeInformer := factory.Core().V1().Nodes().Informer()
@@ -100,14 +116,32 @@ func (c *Controller) Run(ctx context.Context) {
 		return
 	}
 
+	syncList := []cache.InformerSynced{nodeInformer.HasSynced}
+
+	if c.serveReconcile != nil {
+		serviceInformer := factory.Core().V1().Services().Informer()
+		epsInformer := factory.Discovery().V1().EndpointSlices().Informer()
+		serveStores := func() {
+			c.runServeReconcile(ctx, c.store, serviceInformer.GetStore(), epsInformer.GetStore())
+		}
+		for _, inf := range []cache.SharedInformer{serviceInformer, epsInformer} {
+			_, _ = inf.AddEventHandler(cache.ResourceEventHandlerFuncs{
+				AddFunc:    func(interface{}) { serveStores() },
+				UpdateFunc: func(_, _ interface{}) { serveStores() },
+				DeleteFunc: func(interface{}) { serveStores() },
+			})
+		}
+		syncList = append(syncList, serviceInformer.HasSynced, epsInformer.HasSynced)
+	}
+
 	factory.Start(ctx.Done())
 
-	log.Print("controller: waiting for node cache sync")
-	if !cache.WaitForCacheSync(ctx.Done(), nodeInformer.HasSynced) {
+	log.Print("controller: waiting for cache sync")
+	if !cache.WaitForCacheSync(ctx.Done(), syncList...) {
 		log.Print("controller: cache sync failed")
 		return
 	}
-	log.Print("controller: node cache synced")
+	log.Print("controller: cache synced")
 
 	// Run an immediate reconcile from cache (in case we missed events before sync)
 	obj, exists, _ := c.store.GetByKey(c.nodeName)
@@ -118,6 +152,9 @@ func (c *Controller) Run(ctx context.Context) {
 	}
 	c.maybeReconcile(ctx)
 	c.runOtherRoutesReconcile(ctx, c.store)
+	if c.serveReconcile != nil {
+		c.runServeReconcile(ctx, c.store, factory.Core().V1().Services().Informer().GetStore(), factory.Discovery().V1().EndpointSlices().Informer().GetStore())
+	}
 
 	<-ctx.Done()
 	log.Print("controller: stopping")
@@ -197,5 +234,14 @@ func (c *Controller) runOtherRoutesReconcile(ctx context.Context, store cache.St
 	}
 	if err := c.otherRoutesReconcile(ctx, store); err != nil {
 		log.Printf("controller: other-routes reconcile failed: %v", err)
+	}
+}
+
+func (c *Controller) runServeReconcile(ctx context.Context, nodeStore, serviceStore, endpointSliceStore cache.Store) {
+	if c.serveReconcile == nil {
+		return
+	}
+	if err := c.serveReconcile(ctx, nodeStore, serviceStore, endpointSliceStore); err != nil {
+		log.Printf("controller: serve reconcile failed: %v", err)
 	}
 }

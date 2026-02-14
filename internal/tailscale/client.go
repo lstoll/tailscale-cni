@@ -96,6 +96,38 @@ func (c *Client) SetAdvertiseRoutes(ctx context.Context, routes []netip.Prefix) 
 	return err
 }
 
+// GetServeConfig returns the current Tailscale serve configuration from the
+// local daemon. Used to merge our K8s-managed service entries with any existing config.
+func (c *Client) GetServeConfig(ctx context.Context) (*ipn.ServeConfig, error) {
+	return c.lc.GetServeConfig(ctx)
+}
+
+// SetServeConfig sets the Tailscale serve configuration. Call after merging
+// desired Services (e.g. from Kubernetes LoadBalancer Services) with GetServeConfig.
+func (c *Client) SetServeConfig(ctx context.Context, config *ipn.ServeConfig) error {
+	return c.lc.SetServeConfig(ctx, config)
+}
+
+// GetPrefs returns the current Tailscale preferences.
+func (c *Client) GetPrefs(ctx context.Context) (*ipn.Prefs, error) {
+	return c.lc.GetPrefs(ctx)
+}
+
+// SetAdvertiseServices sets the list of Tailscale Service names (e.g. "svc:test-nginx")
+// that this node advertises as a host for. The control plane uses this to show
+// "Advertising the service" and route traffic. Must be called in addition to
+// SetServeConfig for Tailscale Services to be advertised.
+func (c *Client) SetAdvertiseServices(ctx context.Context, serviceNames []string) error {
+	mp := &ipn.MaskedPrefs{
+		AdvertiseServicesSet: true,
+		Prefs: ipn.Prefs{
+			AdvertiseServices: serviceNames,
+		},
+	}
+	_, err := c.lc.EditPrefs(ctx, mp)
+	return err
+}
+
 // EnsureAcceptRoutes turns on "accept routes" (RouteAll) so this node installs
 // routes for subnets advertised by other tailnet nodes (other nodes' pod CIDRs).
 func (c *Client) EnsureAcceptRoutes(ctx context.Context, accept bool) error {
