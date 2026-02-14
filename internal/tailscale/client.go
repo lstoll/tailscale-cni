@@ -7,6 +7,7 @@ import (
 	"net/netip"
 
 	"tailscale.com/client/local"
+	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 )
@@ -146,6 +147,12 @@ func (c *Client) EnsureAcceptRoutes(ctx context.Context, accept bool) error {
 	}
 	_, err = c.lc.EditPrefs(ctx, mp)
 	return err
+}
+
+// WhoIs returns the Tailscale identity (node, user profile) for the given tailnet address.
+// The addr can be "ip" or "ip:port". Uses the LocalAPI whois endpoint.
+func (c *Client) WhoIs(ctx context.Context, addr string) (*apitype.WhoIsResponse, error) {
+	return c.lc.WhoIs(ctx, addr)
 }
 
 // SelfTailscaleIPv4 returns this node's Tailscale IPv4 address from status.

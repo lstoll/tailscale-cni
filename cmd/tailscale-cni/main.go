@@ -8,8 +8,10 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -17,6 +19,7 @@ import (
 	"github.com/lstoll/tailscale-cni/internal/cni"
 	"github.com/lstoll/tailscale-cni/internal/controller"
 	"github.com/lstoll/tailscale-cni/internal/masq"
+	"github.com/lstoll/tailscale-cni/internal/metadata"
 	"github.com/lstoll/tailscale-cni/internal/routes"
 	"github.com/lstoll/tailscale-cni/internal/serve"
 	"github.com/lstoll/tailscale-cni/internal/tailscale"
@@ -45,6 +48,7 @@ func main() {
 	tailscaleIface := flag.String("tailscale-interface", "tailscale0", "Tailscale interface name for masq")
 	nodeName := flag.String("node-name", os.Getenv("NODE_NAME"), "Current node name")
 	resyncPeriod := flag.Duration("resync-period", 30*time.Minute, "How often to full resync node cache (informer resync)")
+	metadataPort := flag.Int("metadata-port", 4160, "Port for metadata service on 127.0.0.1 (0 to disable)")
 	flag.Parse()
 
 	if *nodeName == "" {
@@ -65,16 +69,18 @@ func main() {
 	routeManager := routes.NewManager(*tailscaleIface)
 
 	opts := runReconcileOpts{
-		tsClient:        tsClient,
-		cniDir:          *cniDir,
-		cniBinDir:       *cniBinDir,
-		cniPluginSource: *cniPluginSource,
-		bridgeName:      *bridgeName,
-		clusterCIDR:     *clusterCIDR,
-		tailscaleIface:  *tailscaleIface,
+		tsClient:            tsClient,
+		cniDir:               *cniDir,
+		cniBinDir:            *cniBinDir,
+		cniPluginSource:     *cniPluginSource,
+		bridgeName:           *bridgeName,
+		clusterCIDR:          *clusterCIDR,
+		tailscaleIface:       *tailscaleIface,
+		metadataListenPort:   *metadataPort,
 	}
 
 	serveState := &serveReconcileState{}
+	podResolver := metadata.NewPodStoreResolver(nil)
 	ctrl, err := controller.New(kubeConfig, *nodeName, func(ctx context.Context, ourPodCIDR string) error {
 		return runReconcile(ctx, opts, ourPodCIDR)
 	},
@@ -85,6 +91,9 @@ func main() {
 		controller.WithServeReconciler(func(ctx context.Context, nodeStore, serviceStore, endpointSliceStore cache.Store) error {
 			return reconcileServe(ctx, *nodeName, tsClient, clientset, serveState, nodeStore, serviceStore, endpointSliceStore)
 		}),
+		controller.WithPodStoreReceiver(func(store cache.Store) {
+			podResolver.SetStore(store)
+		}),
 	)
 	if err != nil {
 		log.Fatalf("controller: %v", err)
@@ -92,6 +101,16 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	if *metadataPort > 0 {
+		tokenStore := metadata.NewTokenStore()
+		metaSrv := metadata.NewServer(tsClient, tokenStore, podResolver, net.JoinHostPort("127.0.0.1", strconv.Itoa(*metadataPort)))
+		go func() {
+			if err := metaSrv.Run(ctx); err != nil && ctx.Err() == nil {
+				log.Printf("metadata server: %v", err)
+			}
+		}()
+	}
 
 	ctrl.Run(ctx)
 }
@@ -104,13 +123,14 @@ func defaultEnv(key, fallback string) string {
 }
 
 type runReconcileOpts struct {
-	tsClient        *tailscale.Client
-	cniDir          string
-	cniBinDir       string
-	cniPluginSource string
-	bridgeName      string
-	clusterCIDR     string
-	tailscaleIface  string
+	tsClient            *tailscale.Client
+	cniDir               string
+	cniBinDir            string
+	cniPluginSource      string
+	bridgeName           string
+	clusterCIDR          string
+	tailscaleIface       string
+	metadataListenPort   int
 }
 
 func runReconcile(ctx context.Context, o runReconcileOpts, ourPodCIDR string) error {
@@ -141,8 +161,13 @@ func runReconcile(ctx context.Context, o runReconcileOpts, ourPodCIDR string) er
 		return fmt.Errorf("enable accept-routes: %w", err)
 	}
 
-	// 3) Masq traffic from our pod CIDR that goes out the host (internet); exclude bridge and Tailscale
-	if err := masq.Setup(ourPodCIDR, o.bridgeName, o.tailscaleIface); err != nil {
+	// 3) Masq traffic from our pod CIDR that goes out the host (internet); exclude bridge and Tailscale.
+	//    If metadata port is set, also add prerouting DNAT for metadata service IP.
+	metadataPort := 0
+	if o.metadataListenPort > 0 {
+		metadataPort = o.metadataListenPort
+	}
+	if err := masq.Setup(ourPodCIDR, o.bridgeName, o.tailscaleIface, metadataPort); err != nil {
 		return fmt.Errorf("nftables masq: %w", err)
 	}
 

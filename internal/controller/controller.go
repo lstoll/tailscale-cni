@@ -10,6 +10,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -31,6 +32,10 @@ type OtherRoutesReconciler func(ctx context.Context, store cache.Store) error
 // It receives the node, service, and endpoint slice stores.
 type ServeReconciler func(ctx context.Context, nodeStore, serviceStore, endpointSliceStore cache.Store) error
 
+// PodStoreReceiver is called once the pod informer (filtered to this node) has
+// synced; the store can be used to resolve pod IP to pod (e.g. for metadata service).
+type PodStoreReceiver func(podStore cache.Store)
+
 // Controller watches nodes and triggers reconciliation when our node's pod
 // CIDR changes. It caches the last applied pod CIDR so we only act on real changes.
 // If OtherRoutesReconciler is set, it is also run on any node add/update/delete.
@@ -45,6 +50,7 @@ type Controller struct {
 	reconcile            Reconciler
 	otherRoutesReconcile OtherRoutesReconciler
 	serveReconcile       ServeReconciler
+	podStoreReceiver    PodStoreReceiver
 
 	mu              sync.Mutex
 	lastAppliedCIDR string // last pod CIDR we successfully reconciled for
@@ -69,6 +75,12 @@ func WithOtherRoutesReconciler(fn OtherRoutesReconciler) Option {
 // for Tailscale Services (LoadBalancer) support. Requires Service and EndpointSlice informers.
 func WithServeReconciler(fn ServeReconciler) Option {
 	return func(c *Controller) { c.serveReconcile = fn }
+}
+
+// WithPodStoreReceiver sets a callback that receives the pod informer store (pods on this node only)
+// once synced. Used by the metadata service to resolve caller IP to pod.
+func WithPodStoreReceiver(fn PodStoreReceiver) Option {
+	return func(c *Controller) { c.podStoreReceiver = fn }
 }
 
 // New returns a controller that watches nodes and calls reconcile when our
@@ -118,6 +130,18 @@ func (c *Controller) Run(ctx context.Context) {
 
 	syncList := []cache.InformerSynced{nodeInformer.HasSynced}
 
+	var podStore cache.Store
+	if c.podStoreReceiver != nil {
+		podFactory := informers.NewSharedInformerFactoryWithOptions(c.clientset, c.resyncPeriod,
+			informers.WithTweakListOptions(func(lo *metav1.ListOptions) {
+				lo.FieldSelector = "spec.nodeName=" + c.nodeName
+			}))
+		podInformer := podFactory.Core().V1().Pods().Informer()
+		podStore = podInformer.GetStore()
+		syncList = append(syncList, podInformer.HasSynced)
+		podFactory.Start(ctx.Done())
+	}
+
 	if c.serveReconcile != nil {
 		serviceInformer := factory.Core().V1().Services().Informer()
 		epsInformer := factory.Discovery().V1().EndpointSlices().Informer()
@@ -142,6 +166,10 @@ func (c *Controller) Run(ctx context.Context) {
 		return
 	}
 	log.Print("controller: cache synced")
+
+	if c.podStoreReceiver != nil && podStore != nil {
+		c.podStoreReceiver(podStore)
+	}
 
 	// Run an immediate reconcile from cache (in case we missed events before sync)
 	obj, exists, _ := c.store.GetByKey(c.nodeName)
