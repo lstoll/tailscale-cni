@@ -1,9 +1,36 @@
-# Test LoadBalancer Service exposed as a Tailscale Service.
-# Requires: Tailscale Service "test-nginx" defined in admin console with tcp:80.
-# Nodes must use tag-based identity. See README.
+# Test LoadBalancer Service exposed as a Tailscale Service (HTTP + HTTPS).
+# Requires: Tailscale Service "test-nginx" in admin console with tcp:80 and tcp:443.
+# Set METADATA_DOMAIN (or TAILNET_DNS_SUFFIX in test script) to your service FQDN, e.g. test-nginx.your-tailnet.ts.net
 #
-# Deployed by testenv/test-pod-network.sh; from host (on tailnet) we curl the
-# service hostname to verify register/deregister as pods move.
+# The init container fetches the TLS cert from the metadata API (only this pod is authorized).
+# Nginx serves both port 80 and 443.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: test-nginx-nginx-conf
+  namespace: default
+data:
+  default.conf: |
+    server {
+        listen 80;
+        server_name _;
+        location / {
+            root   /usr/share/nginx/html;
+            index  index.html;
+        }
+    }
+    server {
+        listen 443 ssl;
+        server_name _;
+        ssl_certificate     /etc/nginx/certs/tls.crt;
+        ssl_certificate_key /etc/nginx/certs/tls.key;
+        ssl_protocols       TLSv1.2 TLSv1.3;
+        location / {
+            root   /usr/share/nginx/html;
+            index  index.html;
+        }
+    }
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -23,16 +50,45 @@ spec:
         app: test-nginx
     spec:
       terminationGracePeriodSeconds: 5
+      initContainers:
+        - name: cert-fetcher
+          image: tailscale-cni:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/cert-fetcher"]
+          args:
+            - "-cert-dir=/certs"
+          env:
+            # Set by test script from TAILNET_DNS_SUFFIX (e.g. test-nginx.dingo-nase.ts.net)
+            - name: METADATA_DOMAIN
+              value: "test-nginx.TAILNET_DNS_SUFFIX"
+          volumeMounts:
+            - name: certs
+              mountPath: /certs
       containers:
         - name: nginx
           image: nginx:alpine
           ports:
             - name: http
               containerPort: 80
+            - name: https
+              containerPort: 443
+          volumeMounts:
+            - name: nginx-conf
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: default.conf
+            - name: certs
+              mountPath: /etc/nginx/certs
+              readOnly: true
           resources:
             requests:
               memory: "32Mi"
               cpu: "10m"
+      volumes:
+        - name: certs
+          emptyDir: {}
+        - name: nginx-conf
+          configMap:
+            name: test-nginx-nginx-conf
 ---
 apiVersion: v1
 kind: Service
@@ -42,7 +98,6 @@ metadata:
   labels:
     app: test-nginx
   annotations:
-    # Tailscale Service name (must exist in admin with tcp:80)
     tailscale-cni.lds.li/service-name: "test-nginx"
 spec:
   type: LoadBalancer
@@ -53,4 +108,8 @@ spec:
     - name: http
       port: 80
       targetPort: http
+      protocol: TCP
+    - name: https
+      port: 443
+      targetPort: https
       protocol: TCP

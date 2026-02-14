@@ -155,6 +155,12 @@ func (c *Client) WhoIs(ctx context.Context, addr string) (*apitype.WhoIsResponse
 	return c.lc.WhoIs(ctx, addr)
 }
 
+// CertPair returns the TLS certificate and private key for the given domain (e.g. service MagicDNS name).
+// Uses the LocalAPI cert endpoint; tailscaled must have obtained the cert for this domain.
+func (c *Client) CertPair(ctx context.Context, domain string) (certPEM, keyPEM []byte, err error) {
+	return c.lc.CertPair(ctx, domain)
+}
+
 // SelfTailscaleIPv4 returns this node's Tailscale IPv4 address from status.
 // Using it as the route gateway forces traffic out tailscale0; Tailscale then
 // routes it to the peer that advertises the destination subnet.

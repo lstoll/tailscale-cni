@@ -81,6 +81,7 @@ func main() {
 
 	serveState := &serveReconcileState{}
 	podResolver := metadata.NewPodStoreResolver(nil)
+	certAuthorizer := metadata.NewCertAuthorizer()
 	ctrl, err := controller.New(kubeConfig, *nodeName, func(ctx context.Context, ourPodCIDR string) error {
 		return runReconcile(ctx, opts, ourPodCIDR)
 	},
@@ -89,7 +90,7 @@ func main() {
 			return reconcileOtherNodeRoutes(ctx, store, *nodeName, tsClient, routeManager)
 		}),
 		controller.WithServeReconciler(func(ctx context.Context, nodeStore, serviceStore, endpointSliceStore cache.Store) error {
-			return reconcileServe(ctx, *nodeName, tsClient, clientset, serveState, nodeStore, serviceStore, endpointSliceStore)
+			return reconcileServe(ctx, *nodeName, tsClient, clientset, serveState, certAuthorizer, nodeStore, serviceStore, endpointSliceStore)
 		}),
 		controller.WithPodStoreReceiver(func(store cache.Store) {
 			podResolver.SetStore(store)
@@ -104,7 +105,7 @@ func main() {
 
 	if *metadataPort > 0 {
 		tokenStore := metadata.NewTokenStore()
-		metaSrv := metadata.NewServer(tsClient, tokenStore, podResolver, net.JoinHostPort("127.0.0.1", strconv.Itoa(*metadataPort)))
+		metaSrv := metadata.NewServer(tsClient, tokenStore, podResolver, certAuthorizer, net.JoinHostPort("127.0.0.1", strconv.Itoa(*metadataPort)))
 		go func() {
 			if err := metaSrv.Run(ctx); err != nil && ctx.Err() == nil {
 				log.Printf("metadata server: %v", err)
@@ -183,12 +184,15 @@ type serveReconcileState struct {
 
 // reconcileServe updates Tailscale serve config for LoadBalancer Services with our
 // loadBalancerClass that have at least one local endpoint, and patches Service status.
+// If certAuthorizer is non-nil, it also updates the cert authorizer so only pods
+// serving each service may request that service's TLS cert via the metadata API.
 func reconcileServe(
 	ctx context.Context,
 	nodeName string,
 	tsClient *tailscale.Client,
 	clientset kubernetes.Interface,
 	state *serveReconcileState,
+	certAuthorizer metadata.CertAuthorizer,
 	nodeStore, serviceStore, endpointSliceStore cache.Store,
 ) error {
 	obj, exists, _ := nodeStore.GetByKey(nodeName)
@@ -283,6 +287,17 @@ func reconcileServe(
 				log.Printf("serve: patch service %s/%s status: %v", svc.Namespace, svc.Name, err)
 			}
 		}
+	}
+	if certAuthorizer != nil {
+		domainToPodIPs := make(map[string][]string)
+		if magicDNS != "" {
+			svcNameToPodIPs := serve.LocalPodIPsByServiceName(nodeName, podCIDR, services, slices)
+			for svcName, ips := range svcNameToPodIPs {
+				domain := string(svcName.WithoutPrefix()) + "." + magicDNS
+				domainToPodIPs[domain] = ips
+			}
+		}
+		certAuthorizer.SetAllowedDomains(domainToPodIPs)
 	}
 	return nil
 }

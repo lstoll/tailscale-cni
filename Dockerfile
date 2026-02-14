@@ -13,7 +13,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . ./
-RUN --mount=type=cache,target=/root/.cache/go-build CGO_ENABLED=0 go install ./cmd/tailscale-cni
+RUN --mount=type=cache,target=/root/.cache/go-build CGO_ENABLED=0 go install ./cmd/tailscale-cni ./cmd/cert-fetcher
 
 FROM debian:trixie-slim
 
@@ -25,4 +25,5 @@ COPY --from=builder /go/bin/portmap /cni/portmap
 COPY --from=builder /go/bin/loopback /cni/loopback
 
 COPY --from=builder /go/bin/tailscale-cni /usr/local/bin/tailscale-cni
+COPY --from=builder /go/bin/cert-fetcher /usr/local/bin/cert-fetcher
 ENTRYPOINT ["/usr/local/bin/tailscale-cni"]
