@@ -2,7 +2,7 @@
 # Deploy test pods (2 replicas, spread across nodes) and verify:
 # - Pod-to-pod connectivity (ping both ways)
 # - Internet connectivity (ping 8.8.8.8 and google.com from a pod)
-# Use with testenv kubeconfig.
+# Use with testenv kubeconfig. For LoadBalancer/Tailscale Service test see test-lb-service.sh.
 #
 #   export KUBECONFIG=$(pwd)/testenv/kubeconfig
 #   ./testenv/test-pod-network.sh

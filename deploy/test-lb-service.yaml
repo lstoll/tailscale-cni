@@ -1,0 +1,56 @@
+# Test LoadBalancer Service exposed as a Tailscale Service.
+# Requires: Tailscale Service "test-nginx" defined in admin console with tcp:80.
+# Nodes must use tag-based identity. See README.
+#
+# Deployed by testenv/test-pod-network.sh; from host (on tailnet) we curl the
+# service hostname to verify register/deregister as pods move.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-nginx
+  namespace: default
+  labels:
+    app: test-nginx
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: test-nginx
+  template:
+    metadata:
+      labels:
+        app: test-nginx
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: nginx
+          image: nginx:alpine
+          ports:
+            - name: http
+              containerPort: 80
+          resources:
+            requests:
+              memory: "32Mi"
+              cpu: "10m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-nginx
+  namespace: default
+  labels:
+    app: test-nginx
+  annotations:
+    # Tailscale Service name (must exist in admin with tcp:80)
+    tailscale-cni.lds.li/service-name: "test-nginx"
+spec:
+  type: LoadBalancer
+  loadBalancerClass: lds.li/tailscale-cni
+  selector:
+    app: test-nginx
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
