@@ -105,3 +105,44 @@ else
   echo "FAIL: ping google.com failed. Check cluster DNS and/or outbound connectivity."
   exit 1
 fi
+
+echo ""
+echo "=== Metadata service (token + identity) ==="
+# Get the other node's Tailscale IP so we can look up its identity from a pod.
+# In testenv we have control-plane and node; get Tailscale IP of the node that POD_B is on (the "other" node from POD_A's perspective).
+NODE_B=$(kubectl get pod "$POD_B" -o jsonpath='{.spec.nodeName}')
+TAILSCALE_IP=""
+if [[ -d "$SCRIPT_DIR" ]]; then
+  for n in "$NODE_B" control-plane node; do
+    TAILSCALE_IP=$(cd "$SCRIPT_DIR" && vagrant ssh "$n" -c "tailscale ip -4 2>/dev/null" 2>/dev/null | tr -d '\r\n' || true)
+    [[ -n "$TAILSCALE_IP" ]] && break
+  done
+fi
+if [[ -z "$TAILSCALE_IP" ]]; then
+  echo "Skipping metadata identity test (could not get other node Tailscale IP; run from testenv with vagrant)."
+else
+  echo "Other node ($NODE_B) Tailscale IP: $TAILSCALE_IP"
+  # Run a one-off pod with curl on the same node as POD_A to hit the metadata service
+  NODE_A=$(kubectl get pod "$POD_A" -o jsonpath='{.spec.nodeName}')
+  METADATA_OUT=$(kubectl run metadata-test --rm -i --restart=Never --image=curlimages/curl --overrides="{\"spec\":{\"nodeName\":\"$NODE_A\"}}" -- curl -sS -w "\n%{http_code}" -X PUT -H "X-Tailscale-Metadata-Token-TTL-Seconds: 60" "http://169.254.169.253/metadata/api/token" 2>/dev/null || true)
+  TOKEN=$(echo "$METADATA_OUT" | head -n -1)
+  HTTP_CODE=$(echo "$METADATA_OUT" | tail -1)
+  if [[ "$HTTP_CODE" != "200" || -z "$TOKEN" ]]; then
+    echo "FAIL: metadata token request returned HTTP $HTTP_CODE or empty token"
+    exit 1
+  fi
+  echo "OK: metadata token obtained."
+  IDENTITY_OUT=$(kubectl run metadata-identity-test --rm -i --restart=Never --image=curlimages/curl --overrides="{\"spec\":{\"nodeName\":\"$NODE_A\"}}" -- curl -sS -w "\n%{http_code}" -H "X-Tailscale-Metadata-Token: $TOKEN" "http://169.254.169.253/metadata/identity?ip=$TAILSCALE_IP" 2>/dev/null || true)
+  IDENTITY_HTTP=$(echo "$IDENTITY_OUT" | tail -1)
+  IDENTITY_BODY=$(echo "$IDENTITY_OUT" | head -n -1)
+  if [[ "$IDENTITY_HTTP" != "200" ]]; then
+    echo "FAIL: metadata identity request returned HTTP $IDENTITY_HTTP (body: $IDENTITY_BODY)"
+    exit 1
+  fi
+  if ! echo "$IDENTITY_BODY" | grep -q '"node"'; then
+    echo "FAIL: metadata identity response missing node (body: $IDENTITY_BODY)"
+    exit 1
+  fi
+  echo "OK: metadata identity lookup for $TAILSCALE_IP returned node/userProfile."
+  echo "    $IDENTITY_BODY"
+fi
