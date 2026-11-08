@@ -58,6 +58,10 @@ spec:
               value: "/opt/cni/bin"
             - name: CLUSTER_CIDR
               value: "10.99.0.0/16"
+            # Comma-separated CIDRs (besides pods and cluster nodes) that may
+            # reach pod IPs directly, e.g. an admin's tailnet IP.
+            - name: POD_INGRESS_ALLOW
+              value: ""
           args:
             - -tailscale-interface=tailscale0
           volumeMounts:

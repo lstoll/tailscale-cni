@@ -9,6 +9,7 @@ import (
 	"tailscale.com/client/local"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/types/preftype"
 )
 
 // Client talks to the Tailscale daemon on the host (via socket).
@@ -116,6 +117,54 @@ func (c *Client) EnsureAcceptRoutes(ctx context.Context, accept bool) error {
 	return err
 }
 
+// EnsureNoSNAT turns off tailscaled's source NAT for advertised routes, so
+// traffic forwarded into the pod CIDR keeps its original source IP (the remote
+// pod or tailnet client) instead of being rewritten to this node's address.
+// Network policy and pod-visible client IPs depend on this. It reports whether
+// the pref was changed.
+func (c *Client) EnsureNoSNAT(ctx context.Context) (bool, error) {
+	prefs, err := c.lc.GetPrefs(ctx)
+	if err != nil {
+		return false, err
+	}
+	if prefs.NoSNAT {
+		return false, nil
+	}
+	mp := &ipn.MaskedPrefs{
+		NoSNATSet: true,
+		Prefs: ipn.Prefs{
+			NoSNAT: true,
+		},
+	}
+	if _, err := c.lc.EditPrefs(ctx, mp); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// EnsureNetfilterMode sets how tailscaled manages netfilter rules. It reports
+// the previous mode and whether the pref was changed.
+func (c *Client) EnsureNetfilterMode(ctx context.Context, mode preftype.NetfilterMode) (preftype.NetfilterMode, bool, error) {
+	prefs, err := c.lc.GetPrefs(ctx)
+	if err != nil {
+		return 0, false, err
+	}
+	prev := prefs.NetfilterMode
+	if prev == mode {
+		return prev, false, nil
+	}
+	mp := &ipn.MaskedPrefs{
+		NetfilterModeSet: true,
+		Prefs: ipn.Prefs{
+			NetfilterMode: mode,
+		},
+	}
+	if _, err := c.lc.EditPrefs(ctx, mp); err != nil {
+		return prev, false, err
+	}
+	return prev, true, nil
+}
+
 // SelfTailscaleIPv4 returns this node's Tailscale IPv4 address from status.
 // Using it as the route gateway forces traffic out tailscale0; Tailscale then
 // routes it to the peer that advertises the destination subnet.
@@ -126,6 +175,29 @@ func SelfTailscaleIPv4(st *ipnstate.Status) (netip.Addr, bool) {
 	}
 	a := firstIPv4(st.TailscaleIPs)
 	return a, a.IsValid()
+}
+
+// ClusterPeerIPv4s returns the Tailscale IPv4 addresses of peers that are
+// currently routing a subnet inside clusterCIDR, i.e. the other cluster nodes.
+func ClusterPeerIPv4s(st *ipnstate.Status, clusterCIDR netip.Prefix) []netip.Addr {
+	if st == nil {
+		return nil
+	}
+	var out []netip.Addr
+	for _, peer := range st.Peer {
+		if peer == nil || peer.PrimaryRoutes == nil {
+			continue
+		}
+		for _, r := range peer.PrimaryRoutes.All() {
+			if r.Bits() >= clusterCIDR.Bits() && clusterCIDR.Contains(r.Addr()) {
+				if a := firstIPv4(peer.TailscaleIPs); a.IsValid() {
+					out = append(out, a)
+				}
+				break
+			}
+		}
+	}
+	return out
 }
 
 func firstIPv4(addrs []netip.Addr) netip.Addr {
