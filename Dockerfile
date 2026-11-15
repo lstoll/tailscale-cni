@@ -4,6 +4,9 @@ WORKDIR /src
 
 ARG CNI_PLUGINS_VERSION=v1.9.0
 
+# These binaries run on the host, which may not have the builder's libc loader.
+ENV CGO_ENABLED=0
+
 RUN go install github.com/containernetworking/plugins/plugins/ipam/host-local@${CNI_PLUGINS_VERSION} && \
     go install github.com/containernetworking/plugins/plugins/main/bridge@${CNI_PLUGINS_VERSION} && \
     go install github.com/containernetworking/plugins/plugins/meta/portmap@${CNI_PLUGINS_VERSION} && \
@@ -13,7 +16,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . ./
-RUN --mount=type=cache,target=/root/.cache/go-build CGO_ENABLED=0 go install ./cmd/tailscale-cni
+RUN --mount=type=cache,target=/root/.cache/go-build go install ./cmd/tailscale-cni
 
 FROM debian:trixie-slim
 
